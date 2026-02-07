@@ -1,5 +1,5 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
-load("//xla:py_strict.bzl", "py_strict_binary")
+load("//third_party/rules_python/python:py_binary.bzl", "py_binary")
 load("//xla:xla.default.bzl", "xla_cc_test")
 load(
     "//xla/tsl:tsl.bzl",
@@ -118,9 +118,10 @@ cc_library(
     ],
 )
 
-py_strict_binary(
+py_binary(
     name = "generate_amdgpu_device_lib_data_tool",
     srcs = ["generate_amdgpu_device_lib_data_tool.py"],
+    strict_deps = True,
 )
 
 genrule(
@@ -403,6 +404,7 @@ cc_library(
         "//xla:xla_proto_cc",
         "//xla/service/llvm_ir:llvm_command_line_options",
         "//xla/stream_executor:device_description",
+        "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/status:statusor",
         "@llvm-project//llvm:SPIRVCodeGen",
         "@llvm-project//llvm:Scalar",
