@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_PYTHON_IFRT_IR_SHARDING_PARAM_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +75,8 @@ namespace ifrt {
 //   is invalid, because the 2 slices on dim-1 can't be distributed to 3 devices
 //   in axis-0.
 //
+// TODO doc unreduced
+//
 // See `support` directory for conversions with other sharding annotations.
 class ShardingParam {
  public:
@@ -98,9 +101,11 @@ class ShardingParam {
     void ToDeviceList(llvm::SmallVectorImpl<int>& out_devices) const;
   };
 
-  ShardingParam(std::vector<int64_t> dim_shards, MinorToMajor minor_to_major)
+  ShardingParam(std::vector<int64_t> dim_shards, MinorToMajor minor_to_major,
+                std::optional<std::vector<int>> unreduced_axes = std::nullopt)
       : dim_shards_(std::move(dim_shards)),
-        minor_to_major_(std::move(minor_to_major)) {}
+        minor_to_major_(std::move(minor_to_major)),
+        unreduced_axes_(std::move(unreduced_axes)) {}
 
   static mlir::FailureOr<ShardingParam> Parse(mlir::AsmParser& ods_parser);
 
@@ -134,6 +139,12 @@ class ShardingParam {
   llvm::ArrayRef<int64_t> dim_shards() const { return dim_shards_; }
   const MinorToMajor& minor_to_major() const { return minor_to_major_; }
 
+  // Returns whether the array is unreduced on the mesh axes. The element types
+  // are effectively bool, but we use uint8_t for llvm::ArrayRef compatibility.
+  std::optional<llvm::ArrayRef<int>> unreduced_axes() const {
+    return unreduced_axes_;
+  }
+
   bool operator==(const ShardingParam& other) const {
     return dim_shards_ == other.dim_shards_ &&
            minor_to_major_ == other.minor_to_major_;
@@ -144,6 +155,11 @@ class ShardingParam {
   }
 
   llvm::hash_code hash_value() const {
+    if (unreduced_axes_.has_value()) {
+      return llvm::hash_combine(
+          dim_shards(), llvm::ArrayRef<int>(minor_to_major_.permutation),
+          llvm::ArrayRef<int>(minor_to_major_.axis_sizes), *unreduced_axes());
+    }
     return llvm::hash_combine(dim_shards(),
                               llvm::ArrayRef<int>(minor_to_major_.permutation),
                               llvm::ArrayRef<int>(minor_to_major_.axis_sizes));
@@ -155,6 +171,9 @@ class ShardingParam {
     h = H::combine_contiguous(std::move(h),
                               value.minor_to_major_.permutation.data(),
                               value.minor_to_major_.permutation.size());
+    if (value.unreduced_axes_.has_value()) {
+      h = H::combine(std::move(h), *(value.unreduced_axes_));
+    }
     return H::combine_contiguous(std::move(h),
                                  value.minor_to_major_.axis_sizes.data(),
                                  value.minor_to_major_.axis_sizes.size());
@@ -182,6 +201,7 @@ class ShardingParam {
  private:
   std::vector<int64_t> dim_shards_;
   MinorToMajor minor_to_major_;
+  std::optional<std::vector<int>> unreduced_axes_;
 };
 
 llvm::hash_code hash_value(ShardingParam sharding);

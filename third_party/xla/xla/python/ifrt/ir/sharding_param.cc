@@ -16,10 +16,12 @@ limitations under the License.
 #include "xla/python/ifrt/ir/sharding_param.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -30,6 +32,7 @@ limitations under the License.
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
@@ -83,6 +86,12 @@ void PrintInternalV1(llvm::raw_ostream& os, const ShardingParam& sharding) {
       llvm::ArrayRef<int>(sharding.minor_to_major().permutation), os);
   os << "] on ";
   PrintDims<int>(os, sharding.minor_to_major().axis_sizes);
+  if (sharding.unreduced_axes().has_value()) {
+    os << " with unreduced [";
+    llvm::interleaveComma(
+        llvm::ArrayRef<int>(sharding.unreduced_axes().value()), os);
+    os << "]";
+  }
 }
 
 }  // namespace
@@ -161,6 +170,26 @@ mlir::FailureOr<ShardingParam> ShardingParam::ParseV1(
     return mlir::failure();
   }
 
+  std::optional<std::vector<int>> unreduced_axes;
+  if (llvm::succeeded(ods_parser.parseOptionalKeyword("with"))) {
+    if (llvm::failed(ods_parser.parseKeyword("unreduced"))) {
+      return mlir::failure();
+    }
+    unreduced_axes = std::vector<int>();
+    auto parseUnreducedAxes = [&]() -> mlir::ParseResult {
+      int item;
+      if (auto result = ods_parser.parseInteger(item)) {
+        return result;
+      }
+      unreduced_axes->push_back(item);
+      return mlir::ParseResult::success();
+    };
+    if (ods_parser.parseCommaSeparatedList(mlir::AsmParser::Delimiter::Square,
+                                           parseUnreducedAxes)) {
+      return mlir::failure();
+    }
+  }
+
   minor_to_major.axis_sizes.reserve(axis_sizes_64.size());
   for (int64_t size : axis_sizes_64) {
     minor_to_major.axis_sizes.push_back(size);
@@ -170,7 +199,7 @@ mlir::FailureOr<ShardingParam> ShardingParam::ParseV1(
   // std::vector<int64_t>. ShardingParam has Python bindings, so we do not want
   // its constructor to expose a SmallVector.
   return ShardingParam(std::vector(dim_shards.begin(), dim_shards.end()),
-                       std::move(minor_to_major));
+                       std::move(minor_to_major), std::move(unreduced_axes));
 }
 
 void ShardingParam::PrintV1(mlir::AsmPrinter& ods_printer,
@@ -180,6 +209,22 @@ void ShardingParam::PrintV1(mlir::AsmPrinter& ods_printer,
 
 absl::Status ShardingParam::verify() const {
   TF_RETURN_IF_ERROR(minor_to_major().verify());
+  absl::flat_hash_set<int> unreduced_set;
+  if (unreduced_axes().has_value()) {
+    std::vector<int> unreduced_vec = *unreduced_axes();
+    const int axis_size = minor_to_major().axis_sizes.size();
+    for (int64_t unreduced : unreduced_vec) {
+      if (!unreduced_set.insert(unreduced).second) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("`unreduced_axes` has duplicate value: ", unreduced));
+      }
+      if (unreduced < 0 || unreduced >= axis_size) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("`unreduced_axes` has a value out of range. ",
+                         unreduced, " vs ", axis_size));
+      }
+    }
+  }
   int dim_index = 0;
   int cum_size = 1;
   for (const int index : minor_to_major().permutation) {
@@ -193,6 +238,12 @@ absl::Status ShardingParam::verify() const {
     while (dim_index < dim_shards().size() &&
            cum_size % dim_shards()[dim_index] == 0) {
       cum_size /= dim_shards()[dim_index];
+      if (dim_shards()[dim_index] != 1 && unreduced_set.contains(index)) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "`is_unreduced` has a value that is not 1, but the corresponding "
+            "dimension is not replicated: ",
+            index));
+      }
       dim_index++;
     }
   }
@@ -307,7 +358,7 @@ llvm::raw_ostream& operator<<(llvm::raw_ostream& os, ShardingParam sharding) {
 absl::StatusOr<ShardingParam> ShardingParam::FromProto(
     const ShardingParamProto& proto) {
   const SerDesVersionNumber version_number(proto.version_number());
-  if (version_number != SerDesVersionNumber(0)) {
+  if (version_number > SerDesVersionNumber(1)) {
     return absl::FailedPreconditionError(absl::StrCat(
         "Unsupported ", version_number, " for ShardingParam deserialization"));
   }
@@ -319,24 +370,41 @@ absl::StatusOr<ShardingParam> ShardingParam::FromProto(
                                    proto.axis_sizes().end());
   std::vector<int64_t> dim_shards(proto.dim_shards().begin(),
                                   proto.dim_shards().end());
-  return ShardingParam(std::move(dim_shards), std::move(minor_to_major));
+  std::optional<std::vector<int>> unreduced_axes;
+  if (version_number > SerDesVersionNumber(0)) {
+    unreduced_axes = std::vector<int>(proto.unreduced_axes().begin(),
+                                      proto.unreduced_axes().end());
+    if (unreduced_axes->size() == 0) {
+      unreduced_axes = std::nullopt;
+    }
+  }
+  return ShardingParam(std::move(dim_shards), std::move(minor_to_major),
+                       std::move(unreduced_axes));
 }
 
 absl::Status ShardingParam::ToProto(ShardingParamProto& proto,
                                     SerDesVersion version) const {
-  if (version.version_number() < SerDesVersionNumber(0)) {
+  if (version.version_number() > SerDesVersionNumber(1)) {
     return absl::FailedPreconditionError(
         absl::StrCat("Unsupported ", version.version_number(),
                      " for ShardingParam serialization"));
   }
 
   proto.Clear();
-  proto.set_version_number(SerDesVersionNumber(0).value());
+  proto.set_version_number(version.version_number().value());
   proto.mutable_dim_shards()->Add(dim_shards().begin(), dim_shards().end());
   proto.mutable_permutation()->Add(minor_to_major().permutation.begin(),
                                    minor_to_major().permutation.end());
   proto.mutable_axis_sizes()->Add(minor_to_major().axis_sizes.begin(),
                                   minor_to_major().axis_sizes.end());
+  if (unreduced_axes().has_value()) {
+    if (version.version_number() == SerDesVersionNumber(0)) {
+      return absl::FailedPreconditionError(
+          "ShardingParamProto does not support `is_unreduced`");
+    }
+    proto.mutable_unreduced_axes()->Add(unreduced_axes()->begin(),
+                                        unreduced_axes()->end());
+  }
   return absl::OkStatus();
 }
 

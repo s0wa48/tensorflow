@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/python/ifrt/ir/vifrt_bytecode.h"
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -269,12 +270,20 @@ VifrtShardingParamV1Attr VifrtBytecodeInterface::readShardingParamV1Attr(
   llvm::SmallVector<int64_t> dim_shards;
   llvm::SmallVector<int64_t> permutation;
   llvm::SmallVector<int64_t> axis_sizes;
+  llvm::SmallVector<int64_t> unreduced_axes;
   if (mlir::failed(reader.readSignedVarInts(dim_shards)) ||
       mlir::failed(reader.readSignedVarInts(permutation)) ||
-      mlir::failed(reader.readSignedVarInts(axis_sizes))) {
+      mlir::failed(reader.readSignedVarInts(axis_sizes)) ||
+      mlir::failed(reader.readSignedVarInts(unreduced_axes))) {
     reader.emitError() << "Failed to read VifrtShardingParamV1Attr";
     return VifrtShardingParamV1Attr();
   }
+  std::optional<std::vector<int>> unreduced_axes_vec;
+  if (!unreduced_axes.empty()) {
+    unreduced_axes_vec =
+        std::vector<int>(unreduced_axes.begin(), unreduced_axes.end());
+  }
+
   ShardingParam::MinorToMajor minor_to_major;
   minor_to_major.permutation =
       llvm::SmallVector<int, 4>(permutation.begin(), permutation.end());
@@ -282,7 +291,7 @@ VifrtShardingParamV1Attr VifrtBytecodeInterface::readShardingParamV1Attr(
       llvm::SmallVector<int, 4>(axis_sizes.begin(), axis_sizes.end());
   ShardingParam sharding_param(
       std::vector(dim_shards.begin(), dim_shards.end()),
-      std::move(minor_to_major));
+      std::move(minor_to_major), std::move(unreduced_axes_vec));
   return VifrtShardingParamV1Attr::get(getContext(), std::move(sharding_param));
 }
 
@@ -292,11 +301,16 @@ void VifrtBytecodeInterface::write(VifrtShardingParamV1Attr attr,
   auto sharding = attr.getSharding();
   writer.writeSignedVarInts(sharding.dim_shards());
   writer.writeList(sharding.minor_to_major().permutation, [&](int value) {
-    return writer.writeSignedVarInt(static_cast<int64_t>(value));
+    writer.writeSignedVarInt(static_cast<int64_t>(value));
   });
   writer.writeList(sharding.minor_to_major().axis_sizes, [&](int value) {
-    return writer.writeSignedVarInt(static_cast<int64_t>(value));
+    writer.writeSignedVarInt(static_cast<int64_t>(value));
   });
+  auto is_unreduced = sharding.unreduced_axes();
+  writer.writeList(is_unreduced.value_or(llvm::ArrayRef<int>{}),
+                   [&](int value) {
+                     writer.writeSignedVarInt(static_cast<int64_t>(value));
+                   });
 }
 
 VifrtIntervalV1Attr VifrtBytecodeInterface::readIntervalV1Attr(
