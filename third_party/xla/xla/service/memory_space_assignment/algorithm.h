@@ -1362,8 +1362,8 @@ class MsaAlgorithm : public GlobalDecreasingSizeBestFitHeap<HloValue> {
   absl::flat_hash_map<HloPosition, std::vector<int64_t>>
       default_memory_coloring_requirements_;
 
-  // Set of HloUses that are in the default memory.
-  absl::flat_hash_set<HloUse> uses_in_default_memory_;
+  // HloUses that are in the default memory.
+  std::vector<HloUse> uses_in_default_memory_;
 };
 
 }  // namespace memory_space_assignment

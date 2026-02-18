@@ -6549,7 +6549,7 @@ AllocationResult MsaAlgorithm::AllocateSegment(AllocationRequest& request) {
   // default memory.
   (*prev_allocation_in_default_mem_it)->Extend(request.end_time);
   (*prev_allocation_in_default_mem_it)->AddUse(request.use->hlo_use);
-  uses_in_default_memory_.insert(request.use->hlo_use);
+  uses_in_default_memory_.push_back(request.use->hlo_use);
   return allocation_result;
 }
 
@@ -7263,7 +7263,14 @@ absl::Status MsaAlgorithm::WindowPrefetch() {
                       HloDataflowAnalysis::Run(*module_, /*ssa_form=*/false,
                                                /*bitcast_defines_value=*/true));
   MemorySpacePropagation memory_space_propagation(std::move(dataflow_analysis));
-  for (auto [_, cloned] : cloned_insts) {
+
+  std::vector<std::pair<HloInstruction*, HloInstruction*>> sorted_cloned_insts(
+      cloned_insts.begin(), cloned_insts.end());
+  absl::c_sort(sorted_cloned_insts, [](const auto& a, const auto& b) {
+    return a.first->name() < b.first->name();
+  });
+
+  for (auto [_, cloned] : sorted_cloned_insts) {
     for (HloComputation* computation : cloned->called_computations()) {
       memory_space_propagation.RunOnComputation(computation);
     }
@@ -7284,7 +7291,7 @@ absl::Status MsaAlgorithm::WindowPrefetch() {
   }
 
   // Remove the cloned instructions.
-  for (auto [_, cloned] : cloned_insts) {
+  for (auto [_, cloned] : sorted_cloned_insts) {
     HloComputation* computation = cloned->parent();
     CHECK_OK(computation->RemoveInstruction(cloned));
     computation->Cleanup();
